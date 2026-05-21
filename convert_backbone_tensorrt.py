@@ -9,8 +9,8 @@ Usage:
     python convert_backbone_tensorrt.py --all
 
 The backbone accepts:
-    Input: [B, 3, 512, 512] RGB image (normalized)
-    Output: [B, 1280, 32, 32] feature map
+    Input: [B, 3, image_size, image_size] RGB image (normalized)
+    Output: [B, 1280, image_size/16, image_size/16] feature map
 
 
 
@@ -19,6 +19,7 @@ Step 1: Export and convert to TensorRT
 
 # All-in-one: export ONNX + convert TensorRT + benchmark
 python convert_backbone_tensorrt.py --all
+python convert_backbone_tensorrt.py --all --image-size 384
 
 # Or run steps individually:
 python convert_backbone_tensorrt.py --export_onnx    # Export ONNX
@@ -62,6 +63,24 @@ IMAGE_SIZE = (512, 512)  # H, W
 EMBED_DIM = 1280  # dinov3_vith16plus
 PATCH_SIZE = 16
 OUTPUT_SIZE = (32, 32)  # 512 / 16 = 32
+
+
+def configure_image_size(image_size):
+    """Configure fixed input/output shapes and size-specific engine paths."""
+    global IMAGE_SIZE, OUTPUT_SIZE, ONNX_PATH, TRT_PATH_BF16, TRT_PATH_FP16, TRT_PATH
+
+    IMAGE_SIZE = (image_size, image_size)
+    OUTPUT_SIZE = (image_size // PATCH_SIZE, image_size // PATCH_SIZE)
+
+    suffix = "" if image_size == 512 else f"_{image_size}"
+    ONNX_PATH = os.path.join(TRT_OUTPUT_DIR, f"backbone_dinov3{suffix}.onnx")
+    TRT_PATH_BF16 = os.path.join(
+        TRT_OUTPUT_DIR, f"backbone_dinov3{suffix}_bf16.engine"
+    )
+    TRT_PATH_FP16 = os.path.join(
+        TRT_OUTPUT_DIR, f"backbone_dinov3{suffix}_fp16.engine"
+    )
+    TRT_PATH = TRT_PATH_FP16
 
 
 class BackboneWrapper(nn.Module):
@@ -375,8 +394,20 @@ def main():
     parser.add_argument("--benchmark", action="store_true", help="Benchmark PyTorch vs TensorRT")
     parser.add_argument("--all", action="store_true", help="Run all steps")
     parser.add_argument("--batch_sizes", type=str, default="1,2,4", help="Batch sizes for optimization")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=512,
+        choices=[256, 384, 512],
+        help="Fixed square input size for the exported TensorRT engine",
+    )
 
     args = parser.parse_args()
+    configure_image_size(args.image_size)
+    print(f"Configured image size: {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}")
+    print(f"Configured output size: {OUTPUT_SIZE[0]}x{OUTPUT_SIZE[1]}")
+    print(f"ONNX path: {ONNX_PATH}")
+    print(f"TensorRT path: {TRT_PATH}")
 
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
 

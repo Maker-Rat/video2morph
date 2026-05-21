@@ -1,6 +1,6 @@
 TRAIN:
   USE_FP16: true
-  FP16_TYPE: float16
+  FP16_TYPE: bfloat16
 MODEL:
   IMAGE_SIZE:
   - 512

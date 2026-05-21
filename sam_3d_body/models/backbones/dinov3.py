@@ -40,6 +40,7 @@ class Dinov3Backbone(nn.Module):
                 self._trt_backbone = create_tensorrt_backbone(
                     engine_path=engine_path,
                     name=name,
+                    image_size=tuple(self.cfg.MODEL.IMAGE_SIZE),
                 )
                 self._use_tensorrt = True
                 self._compiled = False  # TensorRT mode does not need compile

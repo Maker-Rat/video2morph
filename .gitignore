@@ -13,5 +13,7 @@ checkpoints/**/*.onnx
 checkpoints/**/*.trt
 checkpoints/**/*.plan
 checkpoints/**/*_trt/
+videos/
+body_models/
 
 /output
