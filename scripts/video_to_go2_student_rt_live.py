@@ -850,6 +850,22 @@ class SplitRenderViewer:
             pass
 
 
+class NullViewer:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    @staticmethod
+    def is_running():
+        return True
+
+    @staticmethod
+    def sync(*_args, **_kwargs):
+        return None
+
+
 class LiveStudentRT:
     def __init__(self, args, src_fps):
         morph_root = Path(args.morph_root).expanduser().resolve()
@@ -1187,6 +1203,11 @@ def parse_args():
         action="store_true",
         help="Include the input camera/video frame as a third panel in the split view.",
     )
+    p.add_argument(
+        "--no-viewer",
+        action="store_true",
+        help="Run headless: no MuJoCo/OpenCV viewer. Processing, ZMQ publishing, timing, and autosave still run.",
+    )
     p.add_argument("--viewer-width", type=int, default=1280, help="Target render panel width for split view.")
     p.add_argument("--viewer-height", type=int, default=960, help="Total render panel height for split view.")
     p.add_argument("--render-width", type=int, default=640, help="Internal MuJoCo offscreen render width.")
@@ -1361,21 +1382,27 @@ def main():
         )
 
     dst_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.dst_robot_id}.yaml")
-    model, xml_path = _load_viewer_model(dst_spec, morph_root, floorless=True)
-    logger.info(f"Target viewer XML: {xml_path}")
-    data = mujoco.MjData(model)
-    model.opt.gravity[:] = 0.0
-    has_free_base = model.njnt > 0 and int(model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE) and model.nq >= 7
-    joint_qpos = _get_non_free_joint_qpos_addrs(model)
+    model = data = None
+    has_free_base = False
+    joint_qpos = []
+    if not args.no_viewer:
+        model, xml_path = _load_viewer_model(dst_spec, morph_root, floorless=True)
+        logger.info(f"Target viewer XML: {xml_path}")
+        data = mujoco.MjData(model)
+        model.opt.gravity[:] = 0.0
+        has_free_base = model.njnt > 0 and int(model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE) and model.nq >= 7
+        joint_qpos = _get_non_free_joint_qpos_addrs(model)
     map_dim = min(len(joint_qpos), int(student.dst_stats.njoints))
 
     src_model = src_data = None
     src_has_free_base = False
     src_joint_qpos = []
     src_map_dim = 0
-    show_src_viewer = bool(args.show_src_viewer and not smpl_direct)
+    show_src_viewer = bool(args.show_src_viewer and not smpl_direct and not args.no_viewer)
     if args.show_src_viewer and smpl_direct:
         logger.info("Ignoring --show-src-viewer in --student-input-mode smpl because G1/GMR is skipped.")
+    if args.show_src_viewer and args.no_viewer:
+        logger.info("Ignoring --show-src-viewer because --no-viewer is set.")
     if show_src_viewer:
         src_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.src_robot_id}.yaml")
         src_model, src_xml_path = _load_viewer_model(src_spec, morph_root, floorless=True)
@@ -1493,6 +1520,8 @@ def main():
     atexit.register(lambda: log_final_summary("process exit"))
 
     def apply_dst_frame(dof, root_pos, root_rot):
+        if model is None or data is None:
+            return
         if has_free_base:
             data.qpos[0:3] = root_pos
             data.qpos[3:7] = _to_wxyz(root_rot)
@@ -1518,8 +1547,12 @@ def main():
         unit="src_frame",
     )
     with contextlib.ExitStack() as stack:
-        use_split_viewer = bool(show_src_viewer or args.show_camera_panel or smpl_direct)
-        if use_split_viewer:
+        if args.no_viewer:
+            use_split_viewer = False
+            viewer = stack.enter_context(NullViewer())
+        else:
+            use_split_viewer = bool(show_src_viewer or args.show_camera_panel or smpl_direct)
+        if not args.no_viewer and use_split_viewer:
             viewer = stack.enter_context(
                 SplitRenderViewer(
                     src_model if show_src_viewer else None,
@@ -1534,7 +1567,7 @@ def main():
                     show_camera=args.show_camera_panel,
                 )
             )
-        else:
+        elif not args.no_viewer:
             viewer = stack.enter_context(mujoco.viewer.launch_passive(model, data))
             viewer.cam.distance = 2.8
             viewer.cam.azimuth = 45
