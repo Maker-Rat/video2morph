@@ -9,6 +9,7 @@ import os
 import pickle
 import sys
 import time
+import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
 
@@ -37,6 +38,10 @@ from video_to_gmr_smpl_npz import (
 )
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOCAL_ROBOT_ASSET_ROOT = REPO_ROOT / "assets" / "robots"
+
+
 def _to_wxyz(quat_xyzw):
     q = np.asarray(quat_xyzw, dtype=np.float32).reshape(4)
     return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
@@ -60,6 +65,58 @@ def _get_non_free_joint_qpos_addrs(model):
             continue
         out.append(int(model.jnt_qposadr[j]))
     return out
+
+
+def _local_robot_xml_path(spec, morph_root):
+    spec_xml = spec.source_xml
+    if spec_xml.is_absolute():
+        try:
+            rel = spec_xml.relative_to(morph_root)
+        except ValueError:
+            rel = Path("assets") / "robots" / spec_xml.name
+    else:
+        rel = spec_xml
+
+    parts = rel.parts
+    if "robots" in parts:
+        rel = Path(*parts[parts.index("robots") + 1:])
+    local = LOCAL_ROBOT_ASSET_ROOT / rel
+    if local.exists():
+        return local.resolve()
+
+    fallback = spec_xml if spec_xml.is_absolute() else (morph_root / spec_xml)
+    return fallback.resolve()
+
+
+def _floorless_xml_path(xml_path):
+    xml_path = Path(xml_path).expanduser().resolve()
+    out_path = xml_path.with_name(f"{xml_path.stem}_floorless{xml_path.suffix}")
+    if out_path.exists() and out_path.stat().st_mtime >= xml_path.stat().st_mtime:
+        return out_path
+
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    removed = 0
+    for worldbody in root.findall("worldbody"):
+        for geom in list(worldbody.findall("geom")):
+            name = str(geom.get("name", "")).lower()
+            gtype = str(geom.get("type", "")).lower()
+            material = str(geom.get("material", "")).lower()
+            if gtype == "plane" or "floor" in name or "ground" in name or "ground" in material:
+                worldbody.remove(geom)
+                removed += 1
+
+    if removed == 0:
+        return xml_path
+    tree.write(out_path, encoding="utf-8", xml_declaration=False)
+    return out_path.resolve()
+
+
+def _load_viewer_model(spec, morph_root, *, floorless=True):
+    xml_path = _local_robot_xml_path(spec, morph_root)
+    if floorless:
+        xml_path = _floorless_xml_path(xml_path)
+    return mujoco.MjModel.from_xml_path(str(xml_path)), xml_path
 
 
 def _extract_yaw_xyzw(quat_xyzw):
@@ -91,6 +148,19 @@ def _yaw_rate_xyzw(prev_quat, curr_quat, dt):
     return float(dyaw / max(float(dt), 1e-8))
 
 
+def _body_ang_vel_xyzw(prev_quat, curr_quat, dt):
+    prev_rot = Rotation.from_quat(np.asarray(prev_quat, dtype=np.float64).reshape(4))
+    curr_rot = Rotation.from_quat(np.asarray(curr_quat, dtype=np.float64).reshape(4))
+    rel = prev_rot.inv() * curr_rot
+    return (rel.as_rotvec() / max(float(dt), 1e-8)).astype(np.float32)
+
+
+def _integrate_body_ang_vel_xyzw(quat_xyzw, body_ang_vel, dt):
+    rot = Rotation.from_quat(np.asarray(quat_xyzw, dtype=np.float64).reshape(4))
+    delta = Rotation.from_rotvec(np.asarray(body_ang_vel, dtype=np.float64).reshape(3) * max(float(dt), 1e-8))
+    return (rot * delta).as_quat().astype(np.float32)
+
+
 def _make_ref_frame(dof_pos, root_pos, root_rot_xyzw, prev_root_pos, prev_root_rot_xyzw, dt, quat_convention):
     dof = np.asarray(dof_pos, dtype=np.float32).reshape(-1)[:12]
     if dof.shape[0] < 12:
@@ -105,10 +175,7 @@ def _make_ref_frame(dof_pos, root_pos, root_rot_xyzw, prev_root_pos, prev_root_r
         lin_vel_world = (root_pos - np.asarray(prev_root_pos, dtype=np.float32).reshape(3)) / max(float(dt), 1e-8)
         yaw = _extract_yaw_xyzw(root_rot_xyzw)
         lin_vel_local = _world_vel_to_local(lin_vel_world, yaw)
-        ang_vel_local = np.array(
-            [0.0, 0.0, _yaw_rate_xyzw(prev_root_rot_xyzw, root_rot_xyzw, dt)],
-            dtype=np.float32,
-        )
+        ang_vel_local = _body_ang_vel_xyzw(prev_root_rot_xyzw, root_rot_xyzw, dt)
 
     quat = root_rot_xyzw if quat_convention == "xyzw" else _quat_xyzw_to_wxyz(root_rot_xyzw)
     return np.concatenate([dof, lin_vel_local, ang_vel_local, quat.astype(np.float32)]).astype(np.float32)
@@ -612,11 +679,22 @@ class SplitRenderViewer:
         self.show_camera = bool(show_camera)
         self.small_height = self.height // 2
         self.render_small_height = self.render_height // 2
-        self.window_name = "camera + G1 | Student target" if self.show_camera else "G1 source | Student target"
+        self.has_src = src_model is not None and src_data is not None
+        if self.show_camera and self.has_src:
+            self.window_name = "camera + source | Student target"
+        elif self.show_camera:
+            self.window_name = "camera | Student target"
+        elif self.has_src:
+            self.window_name = "source | Student target"
+        else:
+            self.window_name = "Student target"
         self.running = True
         src_height = self.render_small_height if self.show_camera else self.render_height
         src_width = min(self.left_width, self.render_width) if self.show_camera else self.render_width
-        self.src_renderer = mujoco.Renderer(src_model, height=src_height, width=src_width)
+        self.src_renderer = (
+            mujoco.Renderer(src_model, height=src_height, width=src_width)
+            if self.has_src else None
+        )
         self.dst_renderer = mujoco.Renderer(dst_model, height=self.render_height, width=self.render_width)
         self.src_cam = self._make_camera(azimuth=-45)
         self.dst_cam = self._make_camera(azimuth=45)
@@ -632,7 +710,7 @@ class SplitRenderViewer:
 
     def __enter__(self):
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        window_width = self.width + (self.left_width if self.show_camera else self.width)
+        window_width = self.width + (self.left_width if (self.show_camera or self.has_src) else 0)
         cv2.resizeWindow(self.window_name, window_width, self.height)
         return self
 
@@ -648,12 +726,45 @@ class SplitRenderViewer:
         renderer.update_scene(data, camera=cam)
         img = renderer.render()
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if title == "target" and data.model.nq >= 7:
+            yaw = _extract_yaw_wxyz(data.qpos[3:7])
+            img = self._draw_heading_overlay(img, yaw, cam.azimuth)
         cv2.putText(
             img,
             title,
             (16, 34),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return img
+
+    @staticmethod
+    def _draw_heading_overlay(img, yaw, cam_azimuth_deg):
+        # Small top-down compass: arrow is robot forward projected into the fixed viewer camera.
+        h, w = img.shape[:2]
+        center = (w - 72, 72)
+        radius = 42
+        cv2.circle(img, center, radius, (40, 40, 40), -1, cv2.LINE_AA)
+        cv2.circle(img, center, radius, (210, 210, 210), 1, cv2.LINE_AA)
+        cv2.line(img, (center[0] - radius + 8, center[1]), (center[0] + radius - 8, center[1]), (90, 90, 90), 1)
+        cv2.line(img, (center[0], center[1] - radius + 8), (center[0], center[1] + radius - 8), (90, 90, 90), 1)
+
+        screen_ang = float(yaw) - np.deg2rad(float(cam_azimuth_deg))
+        end = (
+            int(round(center[0] + np.cos(screen_ang) * (radius - 10))),
+            int(round(center[1] - np.sin(screen_ang) * (radius - 10))),
+        )
+        cv2.arrowedLine(img, center, end, (0, 80, 255), 3, cv2.LINE_AA, tipLength=0.35)
+        yaw_deg = (np.rad2deg(float(yaw)) + 180.0) % 360.0 - 180.0
+        cv2.putText(
+            img,
+            f"{yaw_deg:+.0f}",
+            (center[0] - 28, center[1] + radius + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
@@ -676,10 +787,11 @@ class SplitRenderViewer:
         return panel
 
     def _camera_panel(self, frame_bgr):
+        panel_height = self.small_height if self.has_src else self.height
         if frame_bgr is None:
-            img = np.zeros((self.small_height, self.left_width, 3), dtype=np.uint8)
+            img = np.zeros((panel_height, self.left_width, 3), dtype=np.uint8)
         else:
-            img = self._fit_panel(frame_bgr, self.left_width, self.small_height)
+            img = self._fit_panel(frame_bgr, self.left_width, panel_height)
         cv2.putText(
             img,
             "camera",
@@ -693,19 +805,26 @@ class SplitRenderViewer:
         return img
 
     def sync(self, frame_bgr=None):
-        src_img = self._render_one(self.src_renderer, self.src_data, self.src_cam, "G1")
+        src_img = None
+        if self.has_src:
+            src_img = self._render_one(self.src_renderer, self.src_data, self.src_cam, "source")
         dst_img = self._render_one(self.dst_renderer, self.dst_data, self.dst_cam, "target")
         if self.show_camera:
-            left_col = np.concatenate([self._camera_panel(frame_bgr), src_img], axis=0)
+            if self.has_src:
+                left_col = np.concatenate([self._camera_panel(frame_bgr), src_img], axis=0)
+            else:
+                left_col = self._camera_panel(frame_bgr)
             left_col = cv2.resize(
                 left_col,
                 (self.left_width, self.height),
                 interpolation=cv2.INTER_LINEAR,
             )
-        else:
+        elif self.has_src:
             left_col = cv2.resize(src_img, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        else:
+            left_col = None
         dst_img = cv2.resize(dst_img, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
-        combined = np.concatenate([left_col, dst_img], axis=1)
+        combined = np.concatenate([left_col, dst_img], axis=1) if left_col is not None else dst_img
         cv2.imshow(self.window_name, combined)
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q")):
@@ -720,7 +839,8 @@ class SplitRenderViewer:
     def close(self):
         self.running = False
         try:
-            self.src_renderer.close()
+            if self.src_renderer is not None:
+                self.src_renderer.close()
             self.dst_renderer.close()
         except Exception:
             pass
@@ -805,14 +925,18 @@ class LiveStudentRT:
 
         self.src_root_start = int(self.src_stats.njoints)
         self.dst_root_start = int(self.dst_stats.njoints)
+        self.src_root_dim = int(getattr(self.src_stats, "root_dim", 3 + int(getattr(self.src_stats, "root_ang_dim", 1))))
+        self.dst_root_dim = int(getattr(self.dst_stats, "root_dim", 3 + int(getattr(self.dst_stats, "root_ang_dim", 1))))
+        self.src_root_ang_dim = int(getattr(self.src_stats, "root_ang_dim", max(1, self.src_root_dim - 3)))
+        self.dst_root_ang_dim = int(getattr(self.dst_stats, "root_ang_dim", max(1, self.dst_root_dim - 3)))
         self.src_mean = self.src_stats.mean.detach().cpu().numpy().astype(np.float32)
         self.src_std = self.src_stats.std.detach().cpu().numpy().astype(np.float32)
         self.dst_mean = self.dst_stats.mean.detach().cpu().numpy().astype(np.float32)
         self.dst_std = self.dst_stats.std.detach().cpu().numpy().astype(np.float32)
-        self.src_mean_root = self.src_mean[self.src_root_start:self.src_root_start + 4]
-        self.src_std_root = self.src_std[self.src_root_start:self.src_root_start + 4]
-        self.dst_mean_root = self.dst_mean[self.dst_root_start:self.dst_root_start + 4]
-        self.dst_std_root = self.dst_std[self.dst_root_start:self.dst_root_start + 4]
+        self.src_mean_root = self.src_mean[self.src_root_start:self.src_root_start + self.src_root_dim]
+        self.src_std_root = self.src_std[self.src_root_start:self.src_root_start + self.src_root_dim]
+        self.dst_mean_root = self.dst_mean[self.dst_root_start:self.dst_root_start + self.dst_root_dim]
+        self.dst_std_root = self.dst_std[self.dst_root_start:self.dst_root_start + self.dst_root_dim]
 
         self.reset_state()
 
@@ -822,27 +946,38 @@ class LiveStudentRT:
         self.initialized = False
         self.prev_root_pos = None
         self.prev_yaw = None
+        self.prev_root_rot_xyzw = None
         self.yaw = None
         self.root_pos = np.array([0.0, 0.0, self.dst_start_height], dtype=np.float32)
+        self.root_rot_xyzw = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 
     def _src_feature(self, dof_pos, root_pos, root_rot_xyzw, dt):
         dof_pos = np.asarray(dof_pos, dtype=np.float32).reshape(-1)
         root_pos = np.asarray(root_pos, dtype=np.float32).reshape(3)
+        root_rot_xyzw = np.asarray(root_rot_xyzw, dtype=np.float32).reshape(4)
         yaw = _extract_yaw_xyzw(root_rot_xyzw)
         dt = max(float(dt), 1e-8)
 
         if self.prev_root_pos is None:
             lin_vel_world = np.zeros(3, dtype=np.float32)
-            yaw_rate = 0.0
+            root_ang_rate = np.zeros((self.src_root_ang_dim,), dtype=np.float32)
         else:
             lin_vel_world = (root_pos - self.prev_root_pos) / dt
-            yaw_diff = np.arctan2(np.sin(yaw - self.prev_yaw), np.cos(yaw - self.prev_yaw))
-            yaw_rate = float(yaw_diff / dt)
+            if self.src_root_ang_dim >= 3:
+                root_ang_rate = _body_ang_vel_xyzw(self.prev_root_rot_xyzw, root_rot_xyzw, dt)
+                if self.src_root_ang_dim > 3:
+                    root_ang_rate = np.pad(root_ang_rate, (0, self.src_root_ang_dim - 3)).astype(np.float32)
+                elif self.src_root_ang_dim < 3:
+                    root_ang_rate = root_ang_rate[:self.src_root_ang_dim].astype(np.float32)
+            else:
+                yaw_diff = np.arctan2(np.sin(yaw - self.prev_yaw), np.cos(yaw - self.prev_yaw))
+                root_ang_rate = np.array([float(yaw_diff / dt)], dtype=np.float32)
 
         self.prev_root_pos = root_pos.copy()
         self.prev_yaw = yaw
+        self.prev_root_rot_xyzw = root_rot_xyzw.copy()
         lin_vel_local = _world_vel_to_local(np.clip(lin_vel_world, -10.0, 10.0), yaw)
-        src_phys = np.concatenate([dof_pos, lin_vel_local, np.array([yaw_rate], dtype=np.float32)])
+        src_phys = np.concatenate([dof_pos, lin_vel_local, root_ang_rate])
         if src_phys.shape[0] != self.src_dim:
             raise ValueError(f"student expects src_dim={self.src_dim}, got {src_phys.shape[0]}")
         src_norm = ((src_phys - self.src_mean) / (self.src_std + 1e-8)).astype(np.float32)
@@ -873,25 +1008,40 @@ class LiveStudentRT:
         y_np = y_hat[0].detach().cpu().numpy().astype(np.float32)
 
         if self.root_motion_mode != "student":
-            src_root_phys = src_norm[self.src_root_start:self.src_root_start + 4] * self.src_std_root + self.src_mean_root
-            pred_root_phys = y_np[self.dst_root_start:self.dst_root_start + 4] * self.dst_std_root + self.dst_mean_root
+            src_root_phys = src_norm[self.src_root_start:self.src_root_start + self.src_root_dim] * self.src_std_root + self.src_mean_root
+            pred_root_phys = y_np[self.dst_root_start:self.dst_root_start + self.dst_root_dim] * self.dst_std_root + self.dst_mean_root
+            if src_root_phys.shape[0] != pred_root_phys.shape[0]:
+                n = min(src_root_phys.shape[0], pred_root_phys.shape[0])
+                src_root_phys = src_root_phys[:n]
+                pred_root_phys = pred_root_phys[:n]
             if self.root_motion_mode == "source":
                 out_root_phys = src_root_phys
             else:
                 out_root_phys = (1.0 - self.root_blend_alpha) * pred_root_phys + self.root_blend_alpha * src_root_phys
-            y_np[self.dst_root_start:self.dst_root_start + 4] = (out_root_phys - self.dst_mean_root) / (self.dst_std_root + 1e-8)
+            y_np[self.dst_root_start:self.dst_root_start + out_root_phys.shape[0]] = (
+                out_root_phys - self.dst_mean_root[:out_root_phys.shape[0]]
+            ) / (self.dst_std_root[:out_root_phys.shape[0]] + 1e-8)
 
         self.prev_out.append(y_np)
         y_phys = y_np * self.dst_std + self.dst_mean
         nj = int(self.dst_stats.njoints)
         dst_dof = y_phys[:nj].astype(np.float32)
         lin_vel_local = y_phys[nj:nj + 3].astype(np.float32)
-        yaw_rate = float(y_phys[nj + 3])
+        dst_root_ang = y_phys[nj + 3:nj + 3 + self.dst_root_ang_dim].astype(np.float32)
 
         if self.heading_mode == "source":
             self.yaw = float(src_yaw)
+            half_yaw = self.yaw * 0.5
+            self.root_rot_xyzw = np.array([0.0, 0.0, np.sin(half_yaw), np.cos(half_yaw)], dtype=np.float32)
         else:
-            self.yaw = float(self.yaw + yaw_rate * dt)
+            if self.dst_root_ang_dim >= 3:
+                self.root_rot_xyzw = _integrate_body_ang_vel_xyzw(self.root_rot_xyzw, dst_root_ang[:3], dt)
+                self.yaw = _extract_yaw_xyzw(self.root_rot_xyzw)
+            else:
+                yaw_rate = float(dst_root_ang[-1])
+                self.yaw = float(self.yaw + yaw_rate * dt)
+                half_yaw = self.yaw * 0.5
+                self.root_rot_xyzw = np.array([0.0, 0.0, np.sin(half_yaw), np.cos(half_yaw)], dtype=np.float32)
         c = float(np.cos(self.yaw))
         s = float(np.sin(self.yaw))
         world_vel = np.array(
@@ -903,8 +1053,7 @@ class LiveStudentRT:
             dtype=np.float32,
         )
         self.root_pos = self.root_pos + world_vel * dt
-        half_yaw = self.yaw * 0.5
-        dst_root_rot = np.array([0.0, 0.0, np.sin(half_yaw), np.cos(half_yaw)], dtype=np.float32)
+        dst_root_rot = self.root_rot_xyzw.astype(np.float32)
         return dst_dof, self.root_pos.copy(), dst_root_rot
 
 
@@ -1212,8 +1361,8 @@ def main():
         )
 
     dst_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.dst_robot_id}.yaml")
-    xml_path = dst_spec.source_xml if dst_spec.source_xml.is_absolute() else (morph_root / dst_spec.source_xml)
-    model = mujoco.MjModel.from_xml_path(str(xml_path.resolve()))
+    model, xml_path = _load_viewer_model(dst_spec, morph_root, floorless=True)
+    logger.info(f"Target viewer XML: {xml_path}")
     data = mujoco.MjData(model)
     model.opt.gravity[:] = 0.0
     has_free_base = model.njnt > 0 and int(model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE) and model.nq >= 7
@@ -1229,8 +1378,8 @@ def main():
         logger.info("Ignoring --show-src-viewer in --student-input-mode smpl because G1/GMR is skipped.")
     if show_src_viewer:
         src_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.src_robot_id}.yaml")
-        src_xml_path = src_spec.source_xml if src_spec.source_xml.is_absolute() else (morph_root / src_spec.source_xml)
-        src_model = mujoco.MjModel.from_xml_path(str(src_xml_path.resolve()))
+        src_model, src_xml_path = _load_viewer_model(src_spec, morph_root, floorless=True)
+        logger.info(f"Source viewer XML: {src_xml_path}")
         src_data = mujoco.MjData(src_model)
         src_model.opt.gravity[:] = 0.0
         src_has_free_base = (
@@ -1369,11 +1518,12 @@ def main():
         unit="src_frame",
     )
     with contextlib.ExitStack() as stack:
-        if show_src_viewer:
+        use_split_viewer = bool(show_src_viewer or args.show_camera_panel or smpl_direct)
+        if use_split_viewer:
             viewer = stack.enter_context(
                 SplitRenderViewer(
-                    src_model,
-                    src_data,
+                    src_model if show_src_viewer else None,
+                    src_data if show_src_viewer else None,
                     model,
                     data,
                     width=args.viewer_width,
@@ -1611,7 +1761,7 @@ def main():
             if show_src_viewer and qpos is not None:
                 apply_src_frame(qpos)
             apply_dst_frame(dst_dof, dst_root_pos, dst_root_rot)
-            if show_src_viewer:
+            if use_split_viewer:
                 viewer.sync(frame_bgr=frame_bgr)
             else:
                 viewer.sync()
