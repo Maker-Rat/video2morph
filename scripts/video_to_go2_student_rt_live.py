@@ -129,6 +129,12 @@ def _extract_yaw_wxyz(quat_wxyz):
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
 
 
+def _yaw_only_quat_xyzw(quat_xyzw):
+    yaw = _extract_yaw_xyzw(quat_xyzw)
+    half = 0.5 * yaw
+    return np.array([0.0, 0.0, np.sin(half), np.cos(half)], dtype=np.float32)
+
+
 def _world_vel_to_local(lin_vel_world, yaw):
     c = float(np.cos(yaw))
     s = float(np.sin(yaw))
@@ -1187,6 +1193,12 @@ def parse_args():
     p.add_argument("--root-motion-mode", choices=["student", "source", "blend"], default="source")
     p.add_argument("--root-blend-alpha", type=float, default=0.7)
     p.add_argument(
+        "--target-root-rotation-mode",
+        choices=["student", "yaw"],
+        default="student",
+        help="student uses the target root quaternion as predicted; yaw strips target roll/pitch before smoothing, viewer, ZMQ, and autosave.",
+    )
+    p.add_argument(
         "--heading-mode",
         choices=["integrate", "source"],
         default="source",
@@ -1207,6 +1219,11 @@ def parse_args():
         "--no-viewer",
         action="store_true",
         help="Run headless: no MuJoCo/OpenCV viewer. Processing, ZMQ publishing, timing, and autosave still run.",
+    )
+    p.add_argument(
+        "--viewer-ground",
+        action="store_true",
+        help="Render source/target viewer XMLs with their ground plane. Default removes the floor for local-frame live viewing.",
     )
     p.add_argument("--viewer-width", type=int, default=1280, help="Target render panel width for split view.")
     p.add_argument("--viewer-height", type=int, default=960, help="Total render panel height for split view.")
@@ -1386,7 +1403,7 @@ def main():
     has_free_base = False
     joint_qpos = []
     if not args.no_viewer:
-        model, xml_path = _load_viewer_model(dst_spec, morph_root, floorless=True)
+        model, xml_path = _load_viewer_model(dst_spec, morph_root, floorless=not args.viewer_ground)
         logger.info(f"Target viewer XML: {xml_path}")
         data = mujoco.MjData(model)
         model.opt.gravity[:] = 0.0
@@ -1405,7 +1422,7 @@ def main():
         logger.info("Ignoring --show-src-viewer because --no-viewer is set.")
     if show_src_viewer:
         src_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.src_robot_id}.yaml")
-        src_model, src_xml_path = _load_viewer_model(src_spec, morph_root, floorless=True)
+        src_model, src_xml_path = _load_viewer_model(src_spec, morph_root, floorless=not args.viewer_ground)
         logger.info(f"Source viewer XML: {src_xml_path}")
         src_data = mujoco.MjData(src_model)
         src_model.opt.gravity[:] = 0.0
@@ -1728,6 +1745,9 @@ def main():
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 student_ms = (time.perf_counter() - student_start) * 1000.0
+
+            if args.target_root_rotation_mode == "yaw":
+                dst_root_rot = _yaw_only_quat_xyzw(dst_root_rot)
 
             dst_dof, dst_root_pos, dst_root_rot = target_smoother.step(
                 dst_dof, dst_root_pos, dst_root_rot
