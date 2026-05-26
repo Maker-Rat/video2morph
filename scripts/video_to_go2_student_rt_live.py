@@ -167,10 +167,20 @@ def _integrate_body_ang_vel_xyzw(quat_xyzw, body_ang_vel, dt):
     return (rot * delta).as_quat().astype(np.float32)
 
 
-def _make_ref_frame(dof_pos, root_pos, root_rot_xyzw, prev_root_pos, prev_root_rot_xyzw, dt, quat_convention):
-    dof = np.asarray(dof_pos, dtype=np.float32).reshape(-1)[:12]
-    if dof.shape[0] < 12:
-        dof = np.pad(dof, (0, 12 - dof.shape[0])).astype(np.float32)
+def _make_ref_frame(
+    dof_pos,
+    root_pos,
+    root_rot_xyzw,
+    prev_root_pos,
+    prev_root_rot_xyzw,
+    dt,
+    quat_convention,
+    num_joints,
+):
+    num_joints = int(num_joints)
+    dof = np.asarray(dof_pos, dtype=np.float32).reshape(-1)[:num_joints]
+    if dof.shape[0] < num_joints:
+        dof = np.pad(dof, (0, num_joints - dof.shape[0])).astype(np.float32)
 
     root_pos = np.asarray(root_pos, dtype=np.float32).reshape(3)
     root_rot_xyzw = np.asarray(root_rot_xyzw, dtype=np.float32).reshape(4)
@@ -272,7 +282,7 @@ class SmplPacketPublisher:
 class RefPacketPublisher:
     DEFAULT_OFFSETS = (0, 1, 2, 5, 10)
 
-    def __init__(self, endpoint, robot, fps, quat_convention="xyzw", offsets=None):
+    def __init__(self, endpoint, robot, fps, quat_convention="xyzw", offsets=None, num_joints=12):
         import zmq
 
         self.endpoint = endpoint
@@ -280,6 +290,10 @@ class RefPacketPublisher:
         self.fps = float(fps)
         self.dt = 1.0 / max(self.fps, 1e-8)
         self.quat_convention = str(quat_convention)
+        self.num_joints = int(num_joints)
+        if self.num_joints <= 0:
+            raise ValueError(f"Invalid publish ref joint count: {self.num_joints}")
+        self.frame_dim = self.num_joints + 10
         self.offsets = tuple(int(x) for x in (offsets if offsets is not None else self.DEFAULT_OFFSETS))
         if len(self.offsets) == 0 or min(self.offsets) < 0:
             raise ValueError(f"Invalid publish ref offsets: {self.offsets}")
@@ -292,7 +306,7 @@ class RefPacketPublisher:
 
     def append_and_publish(self, dof_pos, root_pos, root_rot_xyzw):
         prev = self.frames[-1] if self.frames else None
-        ref22 = _make_ref_frame(
+        ref = _make_ref_frame(
             dof_pos=dof_pos,
             root_pos=root_pos,
             root_rot_xyzw=root_rot_xyzw,
@@ -300,10 +314,11 @@ class RefPacketPublisher:
             prev_root_rot_xyzw=None if prev is None else prev["root_rot"],
             dt=self.dt,
             quat_convention=self.quat_convention,
+            num_joints=self.num_joints,
         )
         self.frames.append(
             {
-                "ref22": ref22,
+                "ref": ref,
                 "root_pos": np.asarray(root_pos, dtype=np.float32).reshape(3).copy(),
                 "root_rot": np.asarray(root_rot_xyzw, dtype=np.float32).reshape(4).copy(),
             }
@@ -313,7 +328,7 @@ class RefPacketPublisher:
 
         anchor = len(self.frames) - 1 - self.latency_frames
         refs = np.stack(
-            [self.frames[anchor + offset]["ref22"] for offset in self.offsets],
+            [self.frames[anchor + offset]["ref"] for offset in self.offsets],
             axis=0,
         ).astype(np.float32)
         packet = {
@@ -324,7 +339,9 @@ class RefPacketPublisher:
             "fps": self.fps,
             "latency_frames": int(self.latency_frames),
             "ref_offsets": list(self.offsets),
-            "ref_shape": [int(len(self.offsets)), 22],
+            "ref_shape": [int(len(self.offsets)), int(self.frame_dim)],
+            "joint_count": int(self.num_joints),
+            "frame_dim": int(self.frame_dim),
             "refs_dtype": "float32",
             "quat_convention": self.quat_convention,
             # Keep this as plain Python data so subscribers in different
@@ -1380,10 +1397,13 @@ def main():
             fps=display_fps,
             quat_convention=args.publish_quat_convention,
             offsets=args.publish_ref_offsets,
+            num_joints=int(student.dst_stats.njoints),
         )
         logger.info(
             f"Publishing delayed ref packets to {args.publish_zmq} "
-            f"(robot={student.dst_robot_id}, quat={args.publish_quat_convention}, offsets={list(args.publish_ref_offsets)})"
+            f"(robot={student.dst_robot_id}, joints={int(student.dst_stats.njoints)}, "
+            f"frame_dim={int(student.dst_stats.njoints) + 10}, "
+            f"quat={args.publish_quat_convention}, offsets={list(args.publish_ref_offsets)})"
         )
 
     smpl_publisher = None
