@@ -7,8 +7,11 @@ import contextlib
 import csv
 import os
 import pickle
+import select
 import sys
+import termios
 import time
+import tty
 import xml.etree.ElementTree as ET
 from collections import deque
 from pathlib import Path
@@ -56,6 +59,20 @@ def _rotvec_to_wxyz(rotvec):
     quat_xyzw = Rotation.from_rotvec(np.asarray(rotvec, dtype=np.float64).reshape(3)).as_quat()
     return _to_wxyz(quat_xyzw.astype(np.float32))
 
+
+def _unique_output_path(path):
+    path = Path(path).expanduser()
+    if not path.exists():
+        return path
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    suffix = path.suffix
+    stem = path.stem if suffix else path.name
+    for idx in range(1000):
+        extra = "" if idx == 0 else f"_{idx:02d}"
+        candidate = path.parent / f"{stem}_{stamp}{extra}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find a unique output path for {path}")
 
 
 def _get_non_free_joint_qpos_addrs(model):
@@ -282,7 +299,7 @@ class SmplPacketPublisher:
 class RefPacketPublisher:
     DEFAULT_OFFSETS = (0, 1, 2, 5, 10)
 
-    def __init__(self, endpoint, robot, fps, quat_convention="xyzw", offsets=None, num_joints=12):
+    def __init__(self, endpoint, robot, fps, quat_convention="xyzw", offsets=None, num_joints=12, motion_mode=0):
         import zmq
 
         self.endpoint = endpoint
@@ -294,6 +311,7 @@ class RefPacketPublisher:
         if self.num_joints <= 0:
             raise ValueError(f"Invalid publish ref joint count: {self.num_joints}")
         self.frame_dim = self.num_joints + 10
+        self.motion_mode = int(motion_mode)
         self.offsets = tuple(int(x) for x in (offsets if offsets is not None else self.DEFAULT_OFFSETS))
         if len(self.offsets) == 0 or min(self.offsets) < 0:
             raise ValueError(f"Invalid publish ref offsets: {self.offsets}")
@@ -304,7 +322,21 @@ class RefPacketPublisher:
         self.frames = []
         self.seq = 0
 
-    def append_and_publish(self, dof_pos, root_pos, root_rot_xyzw):
+    def set_motion_mode(self, motion_mode):
+        self.motion_mode = int(motion_mode)
+
+    def append_and_publish(
+        self,
+        dof_pos,
+        root_pos,
+        root_rot_xyzw,
+        motion_mode=None,
+        gripper_score=None,
+        gripper_target_angle=None,
+        gripper_bin=None,
+    ):
+        if motion_mode is not None:
+            self.set_motion_mode(motion_mode)
         prev = self.frames[-1] if self.frames else None
         ref = _make_ref_frame(
             dof_pos=dof_pos,
@@ -344,11 +376,19 @@ class RefPacketPublisher:
             "frame_dim": int(self.frame_dim),
             "refs_dtype": "float32",
             "quat_convention": self.quat_convention,
+            "motion_mode": int(self.motion_mode),
             # Keep this as plain Python data so subscribers in different
             # NumPy versions/envs do not fail unpickling numpy._core.
             "refs": refs.tolist(),
             "valid": True,
         }
+        if gripper_score is not None:
+            packet["gripper_score"] = float(gripper_score)
+        if gripper_target_angle is not None:
+            packet["gripper_target_angle"] = float(gripper_target_angle)
+            packet["gripper_target"] = float(gripper_target_angle)
+        if gripper_bin is not None:
+            packet["gripper_bin"] = int(gripper_bin)
         self.socket.send_pyobj(packet)
         self.seq += 1
         if len(self.frames) > 64:
@@ -361,6 +401,126 @@ class RefPacketPublisher:
 
     def close(self):
         self.socket.close(linger=0)
+
+
+def _hand_gripper_score(hand_landmarks):
+    fingers = ((8, 5), (12, 9), (16, 13), (20, 17))
+    wrist = np.array(
+        [hand_landmarks[0].x, hand_landmarks[0].y, hand_landmarks[0].z],
+        dtype=np.float32,
+    )
+    scores = []
+    for tip_idx, mcp_idx in fingers:
+        tip = np.array(
+            [hand_landmarks[tip_idx].x, hand_landmarks[tip_idx].y, hand_landmarks[tip_idx].z],
+            dtype=np.float32,
+        )
+        mcp = np.array(
+            [hand_landmarks[mcp_idx].x, hand_landmarks[mcp_idx].y, hand_landmarks[mcp_idx].z],
+            dtype=np.float32,
+        )
+        scores.append(np.linalg.norm(tip - wrist) / (np.linalg.norm(mcp - wrist) + 1.0e-6))
+    raw = float(np.mean(scores))
+    return float(np.clip((raw - 1.0) / 1.5, 0.0, 1.0))
+
+
+class MediaPipeGripperEstimator:
+    """Small hand-open score estimator for optional gripper packet fields."""
+
+    def __init__(
+        self,
+        model_path,
+        *,
+        alpha=0.2,
+        closed_score=0.08,
+        open_score=0.65,
+        bins=5,
+        closed_angle=-0.05,
+        open_angle=-1.15,
+        hand="right",
+        missing_timeout=0.0,
+        debug=False,
+    ):
+        import mediapipe as mp
+        from mediapipe.tasks import python
+        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
+
+        model_path = Path(model_path).expanduser()
+        if not model_path.is_absolute():
+            model_path = REPO_ROOT / model_path
+        if not model_path.is_file():
+            raise FileNotFoundError(f"MediaPipe hand landmarker model not found: {model_path}")
+
+        self.mp = mp
+        self.HandLandmarker = HandLandmarker
+        self.options = HandLandmarkerOptions(
+            base_options=python.BaseOptions(model_asset_path=str(model_path)),
+            running_mode=RunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        self.landmarker = HandLandmarker.create_from_options(self.options)
+        self.alpha = float(alpha)
+        self.closed_score = float(closed_score)
+        self.open_score = float(open_score)
+        self.bins = max(2, int(bins))
+        self.closed_angle = float(closed_angle)
+        self.open_angle = float(open_angle)
+        self.hand = str(hand).lower()
+        if self.hand not in {"right", "left", "any"}:
+            raise ValueError("--gripper-hand must be right, left, or any.")
+        self.missing_timeout = float(missing_timeout)
+        self.debug = bool(debug)
+        self.score = self.open_score
+        self.last_seen_time = 0.0
+        self._last_timestamp_ms = 0
+
+    def close(self):
+        self.landmarker.close()
+
+    def _score_to_bin_and_target(self, score):
+        normalized = (float(score) - self.closed_score) / max(self.open_score - self.closed_score, 1.0e-6)
+        normalized = float(np.clip(normalized, 0.0, 1.0))
+        bin_idx = int(round(normalized * (self.bins - 1)))
+        quantized = bin_idx / float(self.bins - 1)
+        target = (1.0 - quantized) * self.closed_angle + quantized * self.open_angle
+        return bin_idx, float(target)
+
+    def _select_hand_landmarks(self, result):
+        if not result.hand_landmarks:
+            return None
+        if self.hand == "any" or not getattr(result, "handedness", None):
+            return result.hand_landmarks[0]
+        for landmarks, handedness in zip(result.hand_landmarks, result.handedness):
+            label = ""
+            if handedness:
+                label = str(handedness[0].category_name).lower()
+            if label == self.hand:
+                return landmarks
+        return None
+
+    def update(self, frame_bgr):
+        now = time.monotonic()
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=rgb)
+        timestamp_ms = max(int(now * 1000.0), self._last_timestamp_ms + 1)
+        self._last_timestamp_ms = timestamp_ms
+        result = self.landmarker.detect_for_video(mp_image, timestamp_ms)
+        hand_landmarks = self._select_hand_landmarks(result)
+        if hand_landmarks is not None:
+            raw_score = _hand_gripper_score(hand_landmarks)
+            self.score = self.alpha * raw_score + (1.0 - self.alpha) * self.score
+            self.last_seen_time = now
+        elif (now - self.last_seen_time) > self.missing_timeout:
+            self.score = self.open_score
+        bin_idx, target = self._score_to_bin_and_target(self.score)
+        return {
+            "score": float(self.score),
+            "target_angle": float(target),
+            "bin": int(bin_idx),
+            "valid": hand_landmarks is not None,
+        }
 
 
 class CameraLocalRootIntegrator:
@@ -1096,6 +1256,185 @@ class LiveStudentRT:
         return dst_dof, self.root_pos.copy(), dst_root_rot
 
 
+
+
+def _load_dual_yuna_config(path):
+    config_path = Path(path).expanduser().resolve()
+    if not config_path.exists():
+        raise FileNotFoundError(f"Dual Yuna config not found: {config_path}")
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError("--dual-yuna-config requires PyYAML in the video2morph environment") from exc
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f) or {}
+    modes = cfg.get("modes")
+    if not modes:
+        raise ValueError("Dual Yuna config must contain a non-empty 'modes' section")
+    normalized = []
+    if isinstance(modes, dict):
+        items = modes.items()
+    elif isinstance(modes, list):
+        items = []
+        for idx, entry in enumerate(modes):
+            if not isinstance(entry, dict):
+                raise ValueError("Each mode in dual Yuna config must be a mapping")
+            items.append((entry.get("name", f"mode_{idx}"), entry))
+    else:
+        raise ValueError("Dual Yuna config 'modes' must be a mapping or list")
+    for name, mode_cfg in items:
+        if not isinstance(mode_cfg, dict):
+            raise ValueError(f"Mode {name!r} must be a mapping")
+        cfg_copy = dict(mode_cfg)
+        cfg_copy.setdefault("name", str(name))
+        if "motion_mode" not in cfg_copy:
+            raise ValueError(f"Mode {name!r} is missing required 'motion_mode'")
+        cfg_copy["motion_mode"] = int(cfg_copy["motion_mode"])
+        if cfg_copy["motion_mode"] not in (0, 1):
+            raise ValueError(f"Mode {name!r} has unsupported motion_mode={cfg_copy['motion_mode']}; expected 0 or 1")
+        normalized.append(cfg_copy)
+    normalized.sort(key=lambda item: item["motion_mode"])
+    return {
+        "path": config_path,
+        "start_mode": cfg.get("start_mode"),
+        "switch_key": cfg.get("switch_key"),
+        "modes": normalized,
+    }
+
+
+class DualYunaStudentManager:
+    """Holds the loco and loco-manip Yuna students and exposes the active one."""
+
+    RESERVED_KEYS = {"name", "motion_mode", "description"}
+
+    def __init__(self, args, src_fps, student_cls, config_path):
+        self.config = _load_dual_yuna_config(config_path)
+        self.mode_order = []
+        self.students = {}
+        self.mode_names = {}
+        self.switch_key = self.config.get("switch_key")
+        first = None
+        for mode_cfg in self.config["modes"]:
+            motion_mode = int(mode_cfg["motion_mode"])
+            mode_args = argparse.Namespace(**vars(args))
+            for key, value in mode_cfg.items():
+                normalized_key = str(key).replace("-", "_")
+                if normalized_key in self.RESERVED_KEYS:
+                    continue
+                if hasattr(mode_args, normalized_key):
+                    setattr(mode_args, normalized_key, value)
+                else:
+                    logger.warning(f"Ignoring unknown dual Yuna mode config key {key!r} for mode {mode_cfg['name']!r}")
+            logger.info(
+                f"Loading Yuna mode {mode_cfg['name']!r} (motion_mode={motion_mode}, "
+                f"task_family={mode_args.task_family}, pair_id={mode_args.pair_id}, ckpt={mode_args.student_ckpt})"
+            )
+            student = student_cls(mode_args, src_fps=src_fps)
+            if first is None:
+                first = student
+                self.src_robot_id = student.src_robot_id
+                self.dst_robot_id = student.dst_robot_id
+                self.src_stats = getattr(student, "src_stats", None)
+                self.dst_stats = student.dst_stats
+            else:
+                if student.dst_robot_id != self.dst_robot_id:
+                    raise ValueError("Dual Yuna modes must target the same destination robot")
+                if int(student.dst_stats.njoints) != int(self.dst_stats.njoints):
+                    raise ValueError("Dual Yuna modes must have the same destination joint count")
+                if getattr(student, "src_robot_id", self.src_robot_id) != self.src_robot_id:
+                    raise ValueError("Dual Yuna modes must use the same source robot")
+            self.mode_order.append(motion_mode)
+            self.students[motion_mode] = student
+            self.mode_names[motion_mode] = str(mode_cfg["name"])
+        if 0 not in self.students:
+            raise ValueError("Dual Yuna config must include loco motion_mode 0")
+        start_mode_cfg = self.config.get("start_mode")
+        if start_mode_cfg is None:
+            self.motion_mode = 0
+        elif isinstance(start_mode_cfg, str) and not start_mode_cfg.strip().lstrip("+-").isdigit():
+            matches = [mode for mode, name in self.mode_names.items() if name == start_mode_cfg]
+            if not matches:
+                raise ValueError(f"Unknown dual Yuna start_mode {start_mode_cfg!r}")
+            self.motion_mode = matches[0]
+        else:
+            self.motion_mode = int(start_mode_cfg)
+        if self.motion_mode not in self.students:
+            raise ValueError(f"Dual Yuna start_mode {self.motion_mode} is not configured")
+        logger.info(
+            f"Dual Yuna pipeline ready. Starting in mode {self.motion_mode} "
+            f"({self.mode_names[self.motion_mode]})."
+        )
+
+    @property
+    def active_student(self):
+        return self.students[self.motion_mode]
+
+    @property
+    def active_mode_name(self):
+        return self.mode_names[self.motion_mode]
+
+    def __getattr__(self, name):
+        return getattr(self.active_student, name)
+
+    def reset_state(self):
+        for student in self.students.values():
+            student.reset_state()
+
+    def switch_to_next_mode(self):
+        idx = self.mode_order.index(self.motion_mode)
+        self.motion_mode = self.mode_order[(idx + 1) % len(self.mode_order)]
+        self.active_student.reset_state()
+        logger.info(f"Switched active Yuna student to mode {self.motion_mode} ({self.active_mode_name})")
+        return self.motion_mode
+
+    def step(self, *args, **kwargs):
+        return self.active_student.step(*args, **kwargs)
+
+
+class TerminalModeSwitcher:
+    def __init__(self, key, enabled):
+        self.key = str(key or "").strip()
+        self.enabled = bool(enabled and self.key and sys.stdin.isatty())
+        self.fd = None
+        self.old_termios = None
+        if self.enabled:
+            self.fd = sys.stdin.fileno()
+            try:
+                self.old_termios = termios.tcgetattr(self.fd)
+                tty.setcbreak(self.fd)
+                atexit.register(self.close)
+                logger.info(f"Press '{self.key}' to toggle Yuna mode.")
+            except (termios.error, OSError, ValueError) as exc:
+                self.enabled = False
+                self.fd = None
+                self.old_termios = None
+                logger.warning(f"Terminal mode switching disabled: {exc}")
+        elif enabled and self.key:
+            logger.info("Terminal mode switching disabled because stdin is not interactive.")
+
+    def close(self):
+        if self.fd is not None and self.old_termios is not None:
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_termios)
+            except (termios.error, OSError, ValueError):
+                pass
+            self.old_termios = None
+
+    def poll(self):
+        if not self.enabled or self.fd is None:
+            return False
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.0)
+        except (OSError, ValueError):
+            return False
+        if not readable:
+            return False
+        try:
+            chars = os.read(self.fd, 32).decode(errors="ignore")
+        except (BlockingIOError, OSError, UnicodeDecodeError):
+            return False
+        return self.key in chars
+
 def _parse_ref_offsets(spec):
     offsets = []
     for raw in str(spec).split(","):
@@ -1146,7 +1485,7 @@ def parse_args():
         default=None,
         help="Optional CSV with camera/root translation debug vectors for coordinate-frame tests.",
     )
-    p.add_argument("--publish-zmq", default=None, help="Optional ZMQ PUB endpoint for Go2 ref packets, e.g. tcp://127.0.0.1:5555")
+    p.add_argument("--publish-zmq", default=None, help="Optional ZMQ PUB endpoint for Go2/Yuna ref packets, e.g. tcp://127.0.0.1:5555")
     p.add_argument("--publish-smpl-zmq", default=None, help="Optional ZMQ PUB endpoint for live SMPL context packets, e.g. tcp://127.0.0.1:5560")
     p.add_argument(
         "--publish-quat-convention",
@@ -1161,19 +1500,50 @@ def parse_args():
         help="Comma-separated reference frame offsets to publish. Default: 0,1,2,5,10. Use 0,1 for current+next.",
     )
     p.add_argument(
+        "--publish-gripper-mediapipe",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add MediaPipe hand gripper_score and binned gripper_target_angle to ref packets.",
+    )
+    p.add_argument(
+        "--gripper-model",
+        default=str(REPO_ROOT / "hand_landmarker.task"),
+        help="MediaPipe hand_landmarker.task path for --publish-gripper-mediapipe.",
+    )
+    p.add_argument("--gripper-smooth-alpha", type=float, default=0.2, help="EMA alpha for gripper score.")
+    p.add_argument("--gripper-closed-score", type=float, default=0.08, help="Score mapped to closed gripper.")
+    p.add_argument("--gripper-open-score", type=float, default=0.65, help="Score mapped to fully open gripper.")
+    p.add_argument("--gripper-bins", type=int, default=5, help="Number of semi-continuous gripper target bins.")
+    p.add_argument("--gripper-closed-angle", type=float, default=-0.05, help="Closed gripper target angle.")
+    p.add_argument("--gripper-open-angle", type=float, default=-1.15, help="Open gripper target angle.")
+    p.add_argument(
+        "--gripper-hand",
+        choices=["right", "left", "any"],
+        default="right",
+        help="Which MediaPipe handedness label controls the gripper. Use any if camera mirroring makes labels unreliable.",
+    )
+    p.add_argument(
+        "--gripper-missing-timeout",
+        type=float,
+        default=0.0,
+        help="Grace seconds without the selected hand before gripper score falls back open. Default 0 opens immediately.",
+    )
+    p.add_argument(
         "--publish-smpl-offsets",
         type=_parse_smpl_offsets,
         default=SmplPacketPublisher.DEFAULT_OFFSETS,
         help="Comma-separated SMPL context offsets to publish. Default: -2,-1,0,1.",
     )
 
-    p.add_argument("--gmr-root", default="/home/marmot/Ritwik/GMR")
+    p.add_argument("--gmr-root", default="/home/psyduck/Ritwik/GMR")
     p.add_argument("--src-robot", default="unitree_g1")
-    p.add_argument("--morph-root", default="/home/marmot/Ritwik/morph")
+    p.add_argument("--morph-root", default="/home/psyduck/Ritwik/morph")
     p.add_argument("--processed-dir", default=None)
+    p.add_argument("--dual-yuna-config", default=None, help="Optional YAML config with two Yuna students: motion_mode 0 loco and motion_mode 1 loco-manip.")
+    p.add_argument("--mode-switch-key", default="m", help="When --dual-yuna-config is active, press this key then Enter to toggle modes. Use '' to disable.")
     p.add_argument("--task-family", default="manipulation")
     p.add_argument("--pair-id", default="g1_to_go2_with_d1")
-    p.add_argument("--student-ckpt", default="/home/marmot/Ritwik/morph/runs/student_rt_g1_go2_d1_v6/best.pt")
+    p.add_argument("--student-ckpt", default="/home/psyduck/Ritwik/morph/runs/student_rt_g1_go2_d1_v6/best.pt")
     p.add_argument("--student-input-mode", choices=["gmr", "smpl"], default="gmr", help="gmr: FastSAM->SMPLX FK->GMR source robot->student_rt. smpl: FastSAM->SMPL features->student_smpl directly.")
     p.add_argument("--smpl-stats", default=None, help="Optional smpl_input_stats.npz for --student-input-mode smpl.")
     p.add_argument(
@@ -1383,11 +1753,17 @@ def main():
         smplx_adapter = None
         retargeter = None
         if smpl_direct:
-            student = LiveStudentSMPLDirect(args, src_fps=effective_fps)
+            if args.dual_yuna_config:
+                student = DualYunaStudentManager(args, effective_fps, LiveStudentSMPLDirect, args.dual_yuna_config)
+            else:
+                student = LiveStudentSMPLDirect(args, src_fps=effective_fps)
         else:
             smplx_adapter = SmplxFrameAdapter(args.smplx_model_dir, device=device)
             retargeter = GMR(src_human="smplx", tgt_robot=args.src_robot, actual_human_height=1.75, verbose=False)
-            student = LiveStudentRT(args, src_fps=effective_fps)
+            if args.dual_yuna_config:
+                student = DualYunaStudentManager(args, effective_fps, LiveStudentRT, args.dual_yuna_config)
+            else:
+                student = LiveStudentRT(args, src_fps=effective_fps)
 
     ref_publisher = None
     if args.publish_zmq:
@@ -1398,12 +1774,14 @@ def main():
             quat_convention=args.publish_quat_convention,
             offsets=args.publish_ref_offsets,
             num_joints=int(student.dst_stats.njoints),
+            motion_mode=int(getattr(student, "motion_mode", 0)),
         )
         logger.info(
             f"Publishing delayed ref packets to {args.publish_zmq} "
             f"(robot={student.dst_robot_id}, joints={int(student.dst_stats.njoints)}, "
             f"frame_dim={int(student.dst_stats.njoints) + 10}, "
-            f"quat={args.publish_quat_convention}, offsets={list(args.publish_ref_offsets)})"
+            f"quat={args.publish_quat_convention}, offsets={list(args.publish_ref_offsets)}, "
+            f"motion_mode={int(getattr(student, 'motion_mode', 0))})"
         )
 
     smpl_publisher = None
@@ -1416,6 +1794,27 @@ def main():
         logger.info(
             f"Publishing delayed SMPL context packets to {args.publish_smpl_zmq} "
             f"(offsets={list(args.publish_smpl_offsets)})"
+        )
+
+    gripper_estimator = None
+    if args.publish_gripper_mediapipe:
+        gripper_estimator = MediaPipeGripperEstimator(
+            args.gripper_model,
+            alpha=args.gripper_smooth_alpha,
+            closed_score=args.gripper_closed_score,
+            open_score=args.gripper_open_score,
+            bins=args.gripper_bins,
+            closed_angle=args.gripper_closed_angle,
+            open_angle=args.gripper_open_angle,
+            hand=args.gripper_hand,
+            missing_timeout=args.gripper_missing_timeout,
+            debug=not args.quiet,
+        )
+        logger.info(
+            "Publishing MediaPipe gripper fields "
+            f"(closed_score={args.gripper_closed_score:.3f}, open_score={args.gripper_open_score:.3f}, "
+            f"bins={args.gripper_bins}, closed_angle={args.gripper_closed_angle:.3f}, "
+            f"open_angle={args.gripper_open_angle:.3f}, hand={args.gripper_hand})"
         )
 
     dst_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{student.dst_robot_id}.yaml")
@@ -1491,10 +1890,12 @@ def main():
     def save_rows_csv(path, rows, label, reason):
         if not path or not rows:
             return
-        out_path = Path(path).expanduser()
-        out_key = str(out_path.resolve()) if out_path.is_absolute() else str((Path.cwd() / out_path).resolve())
-        if out_key in saved_csv_paths:
+        requested_path = Path(path).expanduser()
+        requested_key = str(requested_path.resolve()) if requested_path.is_absolute() else str((Path.cwd() / requested_path).resolve())
+        if requested_key in saved_csv_paths:
             return
+        out_path = _unique_output_path(requested_path)
+        out_key = str(out_path.resolve()) if out_path.is_absolute() else str((Path.cwd() / out_path).resolve())
         out_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         with open(tmp_path, "w", newline="") as f:
@@ -1502,6 +1903,7 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
         os.replace(tmp_path, out_path)
+        saved_csv_paths.add(requested_key)
         saved_csv_paths.add(out_key)
         logger.success(f"Saved {label} CSV to {out_path} ({reason}, rows={len(rows)})")
 
@@ -1583,7 +1985,15 @@ def main():
         desc=("Video -> SMPL -> student" if smpl_direct else "Video -> GMR -> student"),
         unit="src_frame",
     )
+    mode_switch_key = student.switch_key if hasattr(student, "switch_key") and student.switch_key is not None else args.mode_switch_key
+    mode_switcher = TerminalModeSwitcher(
+        mode_switch_key,
+        enabled=hasattr(student, "switch_to_next_mode"),
+    )
+    gripper_state = None
     with contextlib.ExitStack() as stack:
+        if gripper_estimator is not None:
+            stack.callback(gripper_estimator.close)
         if args.no_viewer:
             use_split_viewer = False
             viewer = stack.enter_context(NullViewer())
@@ -1611,6 +2021,16 @@ def main():
             viewer.cam.elevation = -20
 
         while viewer.is_running():
+            if mode_switcher.poll():
+                old_mode = int(getattr(student, "motion_mode", 0))
+                new_mode = int(student.switch_to_next_mode())
+                target_smoother.reset()
+                prev_debug_dst_root_pos = None
+                if ref_publisher is not None:
+                    ref_publisher.set_motion_mode(new_mode)
+                    ref_publisher.reset()
+                logger.info(f"Yuna mode trigger: {old_mode} -> {new_mode}. Ref packet history reset for clean live transition.")
+
             if target_frames > 0 and frame_idx >= target_frames:
                 if not args.loop:
                     break
@@ -1682,6 +2102,8 @@ def main():
                 continue
 
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            if gripper_estimator is not None:
+                gripper_state = gripper_estimator.update(frame_bgr)
             sync_cuda()
             fastsam_start = time.perf_counter()
             with suppress_output(args.quiet), torch.no_grad():
@@ -1843,8 +2265,20 @@ def main():
             out_dof.append(dst_dof.copy())
             out_root_pos.append(dst_root_pos.copy())
             out_root_rot.append(dst_root_rot.copy())
+            zmq_publish_start = time.perf_counter()
+            ref_packet_published = False
             if ref_publisher is not None:
-                ref_publisher.append_and_publish(dst_dof, dst_root_pos, dst_root_rot)
+                ref_packet = ref_publisher.append_and_publish(
+                    dst_dof,
+                    dst_root_pos,
+                    dst_root_rot,
+                    motion_mode=int(getattr(student, "motion_mode", 0)),
+                    gripper_score=None if gripper_state is None else gripper_state["score"],
+                    gripper_target_angle=None if gripper_state is None else gripper_state["target_angle"],
+                    gripper_bin=None if gripper_state is None else gripper_state["bin"],
+                )
+                ref_packet_published = ref_packet is not None
+            zmq_publish_ms = (time.perf_counter() - zmq_publish_start) * 1000.0
             produced += 1
 
             total_ms = (time.perf_counter() - loop_start) * 1000.0
@@ -1853,13 +2287,22 @@ def main():
                     "video_frame_idx": frame_idx,
                     "output_frame_idx": produced - 1,
                     "read_ms": read_ms,
+                    "camera_capture_ms": read_ms,
                     "fastsam_ms": fastsam_ms,
+                    "fastsam3d_body_ms": fastsam_ms,
                     "mhr2smpl_ms": mhr2smpl_ms,
                     "smooth_ms": smooth_ms,
                     "smplx_fk_ms": smplx_fk_ms,
                     "gmr_ms": gmr_ms,
+                    "gmr_retargeting_ms": gmr_ms,
                     "student_ms": student_ms,
+                    "student_inference_ms": student_ms,
+                    "zmq_publish_ms": zmq_publish_ms,
+                    "zmq_ref_packet_published": int(ref_packet_published),
                     "viewer_ms": viewer_ms,
+                    "gripper_score": -1.0 if gripper_state is None else float(gripper_state["score"]),
+                    "gripper_target_angle": 0.0 if gripper_state is None else float(gripper_state["target_angle"]),
+                    "gripper_bin": -1 if gripper_state is None else int(gripper_state["bin"]),
                     "total_ms": total_ms,
                 }
             )

@@ -161,7 +161,7 @@ def parse_args():
     )
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--output-pkl", default=None, help="Optional GMR-style pkl output")
-    parser.add_argument("--gmr-root", default="/home/marmot/Ritwik/GMR", help="Path to GMR checkout")
+    parser.add_argument("--gmr-root", default="/home/psyduck/Ritwik/GMR", help="Path to GMR checkout")
     parser.add_argument("--robot", default="unitree_g1", help="GMR target robot")
     parser.add_argument("--smplx-model-dir", default="body_models", help="Directory containing smplx models")
     parser.add_argument("--smpl-model-path", default="body_models/smpl/SMPL_NEUTRAL.pkl")
