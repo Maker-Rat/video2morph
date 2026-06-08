@@ -45,6 +45,33 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCAL_ROBOT_ASSET_ROOT = REPO_ROOT / "assets" / "robots"
 
 
+def _default_sibling_checkout(name: str) -> str | None:
+    path = (REPO_ROOT.parent / name).resolve()
+    return str(path) if path.exists() else None
+
+
+def _env_path_default(env_name: str, sibling_name: str | None = None) -> str | None:
+    value = os.environ.get(env_name)
+    if value:
+        return value
+    if sibling_name is not None:
+        return _default_sibling_checkout(sibling_name)
+    return None
+
+
+def _expand_user_vars(value):
+    if isinstance(value, str):
+        return os.path.expandvars(os.path.expanduser(value))
+    return value
+
+
+def _require_path_arg(value: str | None, arg_name: str, env_name: str | None = None) -> Path:
+    if not value:
+        env_note = f" or set {env_name}" if env_name else ""
+        raise RuntimeError(f"{arg_name} is required{env_note}.")
+    return Path(_expand_user_vars(value)).resolve()
+
+
 def _to_wxyz(quat_xyzw):
     q = np.asarray(quat_xyzw, dtype=np.float32).reshape(4)
     return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
@@ -629,7 +656,7 @@ class StreamingSmplFeatureBuilder:
 
 class LiveStudentSMPLDirect:
     def __init__(self, args, src_fps):
-        morph_root = Path(args.morph_root).expanduser().resolve()
+        morph_root = _require_path_arg(args.morph_root, "--morph-root", "MORPH_ROOT")
         morph_src = morph_root / "src"
         if str(morph_src) not in sys.path:
             sys.path.insert(0, str(morph_src))
@@ -650,14 +677,14 @@ class LiveStudentSMPLDirect:
         self.smpl_low_std_threshold = float(args.smpl_low_std_threshold)
         self.smpl_root_map = str(args.smpl_root_map)
         self.root_motion_4d_from_smpl_features = root_motion_4d_from_smpl_features
-        processed_root = Path(args.processed_dir).expanduser().resolve() if args.processed_dir else (morph_root / "data" / "processed").resolve()
+        processed_root = Path(_expand_user_vars(args.processed_dir)).resolve() if args.processed_dir else (morph_root / "data" / "processed").resolve()
         resolved = resolve_task_config(morph_root, args.task_family, args.pair_id)
         self.src_robot_id = "smpl"
         self.dst_robot_id = resolved.dst_robot
         dst_spec = load_robot_spec(morph_root / "configs" / "robots" / f"{self.dst_robot_id}.yaml")
         self.dst_stats = InferenceStats(str(_resolve_stats_path(self.dst_robot_id, processed_root)), njoints=dst_spec.njoints, nbodies=dst_spec.nbodies)
         self.dst_start_height = float(args.dst_start_height) if args.dst_start_height is not None else float(dst_spec.nominal_base_height if dst_spec.nominal_base_height is not None else 0.28)
-        ckpt_path = Path(args.student_ckpt).expanduser().resolve()
+        ckpt_path = _require_path_arg(args.student_ckpt, "--student-ckpt", "MORPH_STUDENT_CKPT")
         ckpt = torch.load(str(ckpt_path), map_location="cpu")
         cfg = ckpt.get("config", {})
         self.src_dim = int(cfg.get("src_dim", SMPL_INPUT_DIM))
@@ -1051,7 +1078,7 @@ class NullViewer:
 
 class LiveStudentRT:
     def __init__(self, args, src_fps):
-        morph_root = Path(args.morph_root).expanduser().resolve()
+        morph_root = _require_path_arg(args.morph_root, "--morph-root", "MORPH_ROOT")
         morph_src = morph_root / "src"
         if str(morph_src) not in sys.path:
             sys.path.insert(0, str(morph_src))
@@ -1070,7 +1097,7 @@ class LiveStudentRT:
         self.heading_mode = args.heading_mode
 
         processed_root = (
-            Path(args.processed_dir).expanduser().resolve()
+            Path(_expand_user_vars(args.processed_dir)).resolve()
             if args.processed_dir
             else (morph_root / "data" / "processed").resolve()
         )
@@ -1096,7 +1123,8 @@ class LiveStudentRT:
             else float(dst_spec.nominal_base_height if dst_spec.nominal_base_height is not None else 0.28)
         )
 
-        ckpt = torch.load(args.student_ckpt, map_location="cpu")
+        ckpt_path = _require_path_arg(args.student_ckpt, "--student-ckpt", "MORPH_STUDENT_CKPT")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
         cfg = ckpt.get("config", {})
         self.src_dim = int(cfg.get("src_dim", 0))
         self.dst_dim = int(cfg.get("dst_dim", 0))
@@ -1285,7 +1313,7 @@ def _load_dual_yuna_config(path):
     for name, mode_cfg in items:
         if not isinstance(mode_cfg, dict):
             raise ValueError(f"Mode {name!r} must be a mapping")
-        cfg_copy = dict(mode_cfg)
+        cfg_copy = {key: _expand_user_vars(value) for key, value in mode_cfg.items()}
         cfg_copy.setdefault("name", str(name))
         if "motion_mode" not in cfg_copy:
             raise ValueError(f"Mode {name!r} is missing required 'motion_mode'")
@@ -1535,15 +1563,27 @@ def parse_args():
         help="Comma-separated SMPL context offsets to publish. Default: -2,-1,0,1.",
     )
 
-    p.add_argument("--gmr-root", default="/home/psyduck/Ritwik/GMR")
+    p.add_argument(
+        "--gmr-root",
+        default=_env_path_default("GMR_ROOT", "GMR"),
+        help="Path to GMR checkout. Defaults to $GMR_ROOT, then ../GMR if present.",
+    )
     p.add_argument("--src-robot", default="unitree_g1")
-    p.add_argument("--morph-root", default="/home/psyduck/Ritwik/morph")
+    p.add_argument(
+        "--morph-root",
+        default=_env_path_default("MORPH_ROOT", "morph"),
+        help="Path to Morph checkout. Defaults to $MORPH_ROOT, then ../morph if present.",
+    )
     p.add_argument("--processed-dir", default=None)
     p.add_argument("--dual-yuna-config", default=None, help="Optional YAML config with two Yuna students: motion_mode 0 loco and motion_mode 1 loco-manip.")
     p.add_argument("--mode-switch-key", default="m", help="When --dual-yuna-config is active, press this key then Enter to toggle modes. Use '' to disable.")
     p.add_argument("--task-family", default="manipulation")
     p.add_argument("--pair-id", default="g1_to_go2_with_d1")
-    p.add_argument("--student-ckpt", default="/home/psyduck/Ritwik/morph/runs/student_rt_g1_go2_d1_v6/best.pt")
+    p.add_argument(
+        "--student-ckpt",
+        default=os.environ.get("MORPH_STUDENT_CKPT"),
+        help="Student checkpoint path. Defaults to $MORPH_STUDENT_CKPT. Required unless --dual-yuna-config supplies per-mode checkpoints.",
+    )
     p.add_argument("--student-input-mode", choices=["gmr", "smpl"], default="gmr", help="gmr: FastSAM->SMPLX FK->GMR source robot->student_rt. smpl: FastSAM->SMPL features->student_smpl directly.")
     p.add_argument("--smpl-stats", default=None, help="Optional smpl_input_stats.npz for --student-input-mode smpl.")
     p.add_argument(
@@ -1695,10 +1735,15 @@ def main():
     args = parse_args()
     configure_backbone_trt_for_image_size(args.image_size)
 
-    repo_root = Path(__file__).resolve().parents[1]
-    gmr_root = Path(args.gmr_root).expanduser().resolve()
-    morph_root = Path(args.morph_root).expanduser().resolve()
-    for path in (gmr_root, morph_root / "src"):
+    smpl_direct = args.student_input_mode == "smpl"
+    morph_root = _require_path_arg(args.morph_root, "--morph-root", "MORPH_ROOT")
+    gmr_root = None if smpl_direct and not args.gmr_root else _require_path_arg(args.gmr_root, "--gmr-root", "GMR_ROOT")
+    if not args.dual_yuna_config and not args.student_ckpt:
+        raise RuntimeError(
+            "--student-ckpt is required unless --dual-yuna-config supplies mode-specific checkpoints. "
+            "You can also set MORPH_STUDENT_CKPT."
+        )
+    for path in ([gmr_root] if gmr_root is not None else []) + [morph_root / "src"]:
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
 
@@ -1726,7 +1771,6 @@ def main():
         target_frames = 0
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    smpl_direct = args.student_input_mode == "smpl"
     root_correction_spec = (
         args.smpl_direct_root_correction
         if smpl_direct and args.smpl_direct_root_correction is not None

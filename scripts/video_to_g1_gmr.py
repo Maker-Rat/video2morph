@@ -23,6 +23,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+def _default_gmr_root():
+    value = os.environ.get("GMR_ROOT")
+    if value:
+        return value
+    sibling = (REPO_ROOT.parent / "GMR").resolve()
+    return str(sibling) if sibling.exists() else None
+
+
 def configure_fast_sam_env():
     """Match the optimized inference defaults used by run_demo.sh."""
     defaults = {
@@ -161,7 +169,11 @@ def parse_args():
     )
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--output-pkl", default=None, help="Optional GMR-style pkl output")
-    parser.add_argument("--gmr-root", default="/home/psyduck/Ritwik/GMR", help="Path to GMR checkout")
+    parser.add_argument(
+        "--gmr-root",
+        default=_default_gmr_root(),
+        help="Path to GMR checkout. Defaults to $GMR_ROOT, then ../GMR if present.",
+    )
     parser.add_argument("--robot", default="unitree_g1", help="GMR target robot")
     parser.add_argument("--smplx-model-dir", default="body_models", help="Directory containing smplx models")
     parser.add_argument("--smpl-model-path", default="body_models/smpl/SMPL_NEUTRAL.pkl")
@@ -261,7 +273,9 @@ def main():
     if not 0.0 <= args.root_smooth_alpha <= 1.0:
         raise ValueError("--root-smooth-alpha must be in [0, 1]")
 
-    gmr_root = Path(args.gmr_root).resolve()
+    if not args.gmr_root:
+        raise RuntimeError("--gmr-root is required or set GMR_ROOT.")
+    gmr_root = Path(os.path.expandvars(os.path.expanduser(args.gmr_root))).resolve()
     if not gmr_root.is_dir():
         raise RuntimeError(f"GMR root does not exist: {gmr_root}")
     if str(gmr_root) not in sys.path:

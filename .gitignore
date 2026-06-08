@@ -15,5 +15,6 @@ checkpoints/**/*.plan
 checkpoints/**/*_trt/
 videos/
 body_models/
+logs/
 
 /output

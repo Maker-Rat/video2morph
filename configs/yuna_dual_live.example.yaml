@@ -1,5 +1,9 @@
-# Example dual-mode Yuna live config for scripts/video_to_go2_student_rt_live.py
-# Fill in the loco paths with your actual mode-0 student/dataset.
+# Example dual-mode Yuna live config for scripts/video_to_go2_student_rt_live.py.
+# The script expands environment variables, so set MORPH_ROOT before running:
+#
+#   export MORPH_ROOT=/path/to/morph
+#
+# Then replace the checkpoint filenames below with your trained runs.
 start_mode: loco
 switch_key: m
 
@@ -8,12 +12,12 @@ modes:
     motion_mode: 0
     task_family: locomotion
     pair_id: g1_to_yuna
-    processed_dir: /home/psyduck/Ritwik/morph/data/processed/loco_g1_yuna
-    student_ckpt: /home/psyduck/Ritwik/morph/final_runs/student_loco_g1_yuna/best.pt
+    processed_dir: ${MORPH_ROOT}/data/processed/loco_g1_yuna
+    student_ckpt: ${MORPH_ROOT}/final_runs/student_loco_g1_yuna/best.pt
 
   loco_manip:
     motion_mode: 1
     task_family: manipulation
     pair_id: g1_to_yuna_mix
-    processed_dir: /home/psyduck/Ritwik/morph/data/processed/mix_g1_yuna_slow
-    student_ckpt: /home/psyduck/Ritwik/morph/final_runs/student_mix_g1_yuna_latest/best.pt
+    processed_dir: ${MORPH_ROOT}/data/processed/mix_g1_yuna_slow
+    student_ckpt: ${MORPH_ROOT}/final_runs/student_mix_g1_yuna_latest/best.pt

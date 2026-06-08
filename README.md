@@ -81,6 +81,60 @@ python convert_backbone_tensorrt.py --all
 
 All generated engines are stored under `./checkpoints/`.
 
+## X-Morph Live Retargeting
+
+This fork also contains live video-to-robot reference publishers for the
+X-Morph pipeline. The retargeting/training code lives in a separate local
+`morph` checkout, while this repo owns FastSAM3D Body, camera inference,
+viewer rendering, and ZMQ publishing.
+
+Set the local checkout paths once:
+
+```bash
+export MORPH_ROOT=/path/to/morph
+export GMR_ROOT=/path/to/GMR
+export MORPH_STUDENT_CKPT=$MORPH_ROOT/runs/student_rt_g1_go2/best.pt
+```
+
+If `morph` and `GMR` are sibling directories of this repo, the scripts will
+find them automatically. Otherwise pass `--morph-root`, `--gmr-root`, and
+`--student-ckpt` explicitly.
+
+Example GMR-to-RT-student live command:
+
+```bash
+python scripts/video_to_go2_student_rt_live.py \
+  --video 0 \
+  --morph-root "$MORPH_ROOT" \
+  --gmr-root "$GMR_ROOT" \
+  --processed-dir "$MORPH_ROOT/data/processed/loco_g1_go2" \
+  --task-family locomotion \
+  --pair-id g1_to_go2 \
+  --student-ckpt "$MORPH_STUDENT_CKPT" \
+  --student-device cuda:0 \
+  --root-motion-mode student \
+  --heading-mode integrate \
+  --publish-zmq tcp://127.0.0.1:5555 \
+  --publish-quat-convention wxyz \
+  --publish-ref-offsets 0,1
+```
+
+For headless publishing, add:
+
+```bash
+--no-viewer
+```
+
+For direct SMPL-student inference, set:
+
+```bash
+--student-input-mode smpl
+```
+
+The optional dual-mode Yuna config at
+`configs/yuna_dual_live.example.yaml` uses `${MORPH_ROOT}` placeholders and is
+expanded by the live script at runtime.
+
 ## Real-World Deployment
 
 For instructions on running the publisher, see [docs/realworld_deployment.md](docs/realworld_deployment.md).
