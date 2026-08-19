@@ -1,5 +1,8 @@
 # Fast SAM 3D Body
 
+> [!NOTE]
+> This is the [`video2morph`](https://github.com/Maker-Rat/video2morph) integration fork used by X-Morph. It preserves the upstream Fast SAM 3D Body implementation and adds live monocular video-to-robot retargeting and reference publishing. The X-Morph additions are documented under [X-Morph Live Retargeting](#x-morph-live-retargeting); see the [upstream repository](https://github.com/yangtiming/Fast-SAM-3D-Body) for the original project.
+
 ### Accelerating SAM 3D Body for Real-Time Full-Body Human Mesh Recovery
 
 [Timing Yang](http://yangtiming.github.io)<sup>1</sup>, [Sicheng He](https://hesicheng.net)<sup>1</sup>, [Hongyi Jing](https://hongyijing.me)<sup>1</sup>, [Jiawei Yang](https://jiawei-yang.github.io)<sup>1</sup>, [Zhijian Liu](https://zhijianliu.com)<sup>2,3</sup>, [Chuhang Zou](https://zouchuhang.github.io)<sup>4</sup><sup>†</sup>, [Yue Wang](https://yuewang.xyz)<sup>1,3</sup><sup>†</sup>
@@ -83,10 +86,13 @@ All generated engines are stored under `./checkpoints/`.
 
 ## X-Morph Live Retargeting
 
-This fork also contains live video-to-robot reference publishers for the
-X-Morph pipeline. The retargeting/training code lives in a separate local
-`morph` checkout, while this repo owns FastSAM3D Body, camera inference,
-viewer rendering, and ZMQ publishing.
+This fork contains the live video-to-robot interface for X-Morph. The
+[`morph`](https://github.com/Maker-Rat/morph) repository owns retargeting,
+physics correction, and causal-student training; this repository owns Fast SAM
+3D Body inference, optional GMR conversion, target-robot visualization, and ZMQ
+reference publishing. The complementary
+[`kimodo_morph`](https://github.com/Maker-Rat/kimodo_morph) repository provides
+the text-conditioned interface.
 
 Set the local checkout paths once:
 
@@ -99,6 +105,8 @@ export MORPH_STUDENT_CKPT=$MORPH_ROOT/runs/student_rt_g1_go2/best.pt
 If `morph` and `GMR` are sibling directories of this repo, the scripts will
 find them automatically. Otherwise pass `--morph-root`, `--gmr-root`, and
 `--student-ckpt` explicitly.
+Trained X-Morph student and downstream tracking-policy checkpoints are released
+separately and are not committed to this repository.
 
 Example GMR-to-RT-student live command:
 
